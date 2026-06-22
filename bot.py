@@ -1,6 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import json
 import time
@@ -10,14 +7,16 @@ import threading
 from datetime import datetime, timedelta
 import dateparser
 import pytz
+from dateparser.search import search_dates
+from google import genai
 
 # ==========================================
 # 1. INITIALIZATION & CREDENTIALS
 # ==========================================
-BOT_TOKEN     = os.environ.get("BOT_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+BOT_TOKEN          = os.environ.get("BOT_TOKEN", "")
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+NVIDIA_API_KEY     = os.environ.get("NVIDIA_API_KEY", "")
 
 bot       = telebot.TeleBot(BOT_TOKEN)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -25,12 +24,12 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 DATA_FILE = "bot_database.json"
 PH_TZ     = pytz.timezone('Asia/Manila')
 
-# AI provider fallback order: gemini → openai → nvidia
+# AI provider fallback order: gemini → openrouter → nvidia
 AI_PROVIDERS = []
 if GEMINI_API_KEY:
     AI_PROVIDERS.append("gemini")
-if OPENAI_API_KEY:
-    AI_PROVIDERS.append("openai")
+if OPENROUTER_API_KEY:
+    AI_PROVIDERS.append("openrouter")
 if NVIDIA_API_KEY:
     AI_PROVIDERS.append("nvidia")
 
@@ -48,8 +47,8 @@ def load_db():
     data.setdefault("notes", {})
     data.setdefault("schedules", [])
     data.setdefault("classes", {})
-    data.setdefault("recurring", [])   # daily/weekly/monthly repeating tasks
-    data.setdefault("specials", [])    # birthdays, anniversaries, monthsaries
+    data.setdefault("recurring", [])
+    data.setdefault("specials", [])
     return data
 
 def save_db(data):
@@ -70,18 +69,22 @@ def ask_ai(prompt: str) -> str:
                 )
                 return resp.text
 
-            elif provider == "openai":
+            elif provider == "openrouter":
                 import urllib.request, json as _json
                 payload = _json.dumps({
-                    "model": "gpt-4o-mini",
+                    "model": "mistralai/mistral-7b-instruct:free",
                     "messages": [{"role": "user", "content": f"Answer this shortly and concisely: {prompt}"}],
                     "max_tokens": 500
                 }).encode()
                 req = urllib.request.Request(
-                    "https://api.openai.com/v1/chat/completions",
+                    "https://openrouter.ai/api/v1/chat/completions",
                     data=payload,
-                    headers={"Content-Type": "application/json",
-                             "Authorization": f"Bearer {OPENAI_API_KEY}"}
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "HTTP-Referer": "https://github.com",
+                        "X-Title": "CathBot"
+                    }
                 )
                 with urllib.request.urlopen(req, timeout=15) as r:
                     data = _json.loads(r.read())
@@ -97,8 +100,10 @@ def ask_ai(prompt: str) -> str:
                 req = urllib.request.Request(
                     "https://integrate.api.nvidia.com/v1/chat/completions",
                     data=payload,
-                    headers={"Content-Type": "application/json",
-                             "Authorization": f"Bearer {NVIDIA_API_KEY}"}
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {NVIDIA_API_KEY}"
+                    }
                 )
                 with urllib.request.urlopen(req, timeout=15) as r:
                     data = _json.loads(r.read())
@@ -212,7 +217,7 @@ TASK_EXTRACTION_NOISE = {
     'change', 'update', 'edit', 'modify', 'move', 'reschedule', 'reset', 'set',
     'to', 'at', 'the', 'it', 'a', 'an', 'sched', 'schedule',
     'am', 'pm', 'today', 'tomorrow', 'tmr', 'tmrw', 'this', 'now', 'in', 'on',
-    'date', 'time', 'day', 'from', 'for', 'my', 'please', 'the',
+    'date', 'time', 'day', 'from', 'for', 'my', 'please',
     'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
     'january', 'february', 'march', 'april', 'may', 'june', 'july',
     'august', 'september', 'october', 'november', 'december',
@@ -266,9 +271,9 @@ def try_patch_edit(db: dict, raw_text: str, now_ph: datetime) -> tuple:
         if parsed_date:
             new_date = parsed_date
     if change_time:
-        parsed_time = parse_time_only(raw_text)
-        if parsed_time:
-            new_time = parsed_time
+        parsed_time_val = parse_time_only(raw_text)
+        if parsed_time_val:
+            new_time = parsed_time_val
     if new_date == old_date and new_time == old_time:
         return False, ""
     target["date"] = new_date
@@ -304,7 +309,8 @@ def parse_date_only(raw_text: str, now_ph: datetime) -> str:
     if slash_match:
         m, d = int(slash_match.group(1)), int(slash_match.group(2))
         y = int(slash_match.group(3)) if slash_match.group(3) else now_naive.year
-        if y < 100: y += 2000
+        if y < 100:
+            y += 2000
         try:
             return datetime(y, m, d).strftime("%Y-%m-%d")
         except ValueError:
@@ -321,7 +327,8 @@ def parse_date_only(raw_text: str, now_ph: datetime) -> str:
     for name, wday in weekday_map.items():
         if re.search(rf'\b{name}\b', stripped, re.IGNORECASE):
             days_ahead = (wday - now_naive.weekday() + 7) % 7
-            if days_ahead == 0: days_ahead = 7
+            if days_ahead == 0:
+                days_ahead = 7
             return (now_naive + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
     month_map = {
         'january': 1, 'february': 2, 'march': 3, 'april': 4,
@@ -489,8 +496,8 @@ def parse_schedule_time(raw_text: str, now_ph: datetime) -> tuple:
         if md.hour != 0 or md.minute != 0:
             best = (ms, md)
             break
-    matched_str, parsed_time = best
-    return parsed_time, matched_str
+    matched_str, parsed_time_val = best
+    return parsed_time_val, matched_str
 
 # ==========================================
 # 13. TEXT CLEANER
@@ -519,10 +526,10 @@ def clean_task_text(raw_text: str, matched_date_str: str) -> str:
 # 14. RECURRING TASK HELPERS
 # ==========================================
 RECUR_TYPES = {
-    'daily':    r'\beveryday\b|\bdaily\b|\bevery\s+day\b',
-    'weekly':   r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\bweekly\b',
-    'monthly':  r'\bevery\s+month\b|\bmonthly\b|\bevery\s+\d{1,2}(st|nd|rd|th)?\b',
-    'yearly':   r'\bevery\s+year\b|\bannually\b|\byearly\b',
+    'daily':   r'\beveryday\b|\bdaily\b|\bevery\s+day\b',
+    'weekly':  r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\bweekly\b',
+    'monthly': r'\bevery\s+month\b|\bmonthly\b|\bevery\s+\d{1,2}(st|nd|rd|th)?\b',
+    'yearly':  r'\bevery\s+year\b|\bannually\b|\byearly\b',
 }
 
 def detect_recur_type(text: str) -> str:
@@ -533,7 +540,6 @@ def detect_recur_type(text: str) -> str:
     return None
 
 def detect_recur_weekday(text: str) -> str:
-    """For weekly recurrence — which day of week?"""
     days = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']
     t = text.lower()
     for d in days:
@@ -542,29 +548,24 @@ def detect_recur_weekday(text: str) -> str:
     return None
 
 def detect_recur_monthday(text: str) -> int:
-    """For monthly recurrence — which day of month?"""
     m = re.search(r'\bevery\s+(\d{1,2})(?:st|nd|rd|th)?\b', text.lower())
     if m:
         return int(m.group(1))
     return None
 
 def next_recur_date(item: dict, now_ph: datetime) -> datetime:
-    """Compute the next fire datetime for a recurring item from now."""
     now_naive = now_ph.replace(tzinfo=None)
     t_str = item.get("time", "08:00 AM")
     try:
         t_obj = datetime.strptime(t_str, "%I:%M %p").time()
     except ValueError:
         t_obj = datetime.strptime("08:00 AM", "%I:%M %p").time()
-
     rtype = item["recur_type"]
-
     if rtype == "daily":
         candidate = datetime.combine(now_naive.date(), t_obj)
         if candidate <= now_naive:
             candidate += timedelta(days=1)
         return candidate
-
     if rtype == "weekly":
         day_name = item.get("recur_day", "Monday")
         target_wday = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'].index(day_name)
@@ -576,22 +577,17 @@ def next_recur_date(item: dict, now_ph: datetime) -> datetime:
             else:
                 return candidate
         return datetime.combine((now_naive + timedelta(days=days_ahead)).date(), t_obj)
-
     if rtype == "monthly":
         day_of_month = item.get("recur_monthday", 1)
-        # Try this month first
         try:
-            candidate = datetime(now_naive.year, now_naive.month, day_of_month,
-                                 t_obj.hour, t_obj.minute)
+            candidate = datetime(now_naive.year, now_naive.month, day_of_month, t_obj.hour, t_obj.minute)
         except ValueError:
             candidate = None
         if candidate and candidate > now_naive:
             return candidate
-        # Next month
         if now_naive.month == 12:
             return datetime(now_naive.year + 1, 1, day_of_month, t_obj.hour, t_obj.minute)
         return datetime(now_naive.year, now_naive.month + 1, day_of_month, t_obj.hour, t_obj.minute)
-
     if rtype == "yearly":
         month = item.get("recur_month", now_naive.month)
         day   = item.get("recur_day_num", now_naive.day)
@@ -602,11 +598,10 @@ def next_recur_date(item: dict, now_ph: datetime) -> datetime:
         if candidate and candidate > now_naive:
             return candidate
         return datetime(now_naive.year + 1, month, day, t_obj.hour, t_obj.minute)
-
     return now_naive + timedelta(days=1)
 
 # ==========================================
-# 15. SPECIAL EVENT HELPERS (birthday/anniversary/monthsary)
+# 15. SPECIAL EVENT HELPERS
 # ==========================================
 SPECIAL_TYPES = {
     'birthday':    r'\bbirthday\b|\bbday\b',
@@ -622,14 +617,12 @@ def detect_special_type(text: str) -> str:
     return None
 
 def next_special_date(item: dict, now_ph: datetime) -> datetime:
-    """Compute the next occurrence of a special date (yearly for bday/anniv, monthly for monthsary)."""
     now_naive = now_ph.replace(tzinfo=None)
     t_str = item.get("time", "08:00 AM")
     try:
         t_obj = datetime.strptime(t_str, "%I:%M %p").time()
     except ValueError:
         t_obj = datetime.strptime("08:00 AM", "%I:%M %p").time()
-
     if item["special_type"] == "monthsary":
         day_of_month = item.get("day_of_month", 1)
         try:
@@ -641,8 +634,6 @@ def next_special_date(item: dict, now_ph: datetime) -> datetime:
         if now_naive.month == 12:
             return datetime(now_naive.year + 1, 1, day_of_month, t_obj.hour, t_obj.minute)
         return datetime(now_naive.year, now_naive.month + 1, day_of_month, t_obj.hour, t_obj.minute)
-
-    # birthday / anniversary — yearly
     month = item.get("month", now_naive.month)
     day   = item.get("day", now_naive.day)
     try:
@@ -659,27 +650,19 @@ def next_special_date(item: dict, now_ph: datetime) -> datetime:
 @bot.message_handler(func=lambda m: m.text and m.text.strip().startswith("-"))
 def handle_cath_schedule(message):
     raw_text = message.text.strip()[1:].replace("@", "").strip()
-
-    # --- RECURRING: -remind me to take meds 8pm everyday ---
     recur_type = detect_recur_type(raw_text)
     if recur_type:
         handle_recurring_create(message, raw_text, recur_type)
         return
-
-    # --- SPECIAL EVENTS: -birthday mico june 26 ---
     special_type = detect_special_type(raw_text)
     if special_type:
         handle_special_create(message, raw_text, special_type)
         return
-
     if not is_real_schedule_command(raw_text):
         return
-
     db = load_db()
     now_ph = datetime.now(PH_TZ)
     is_edit = detect_edit_intent(raw_text)
-
-    # --- EDIT PATH: PATCH logic ---
     if is_edit:
         success, edit_msg = try_patch_edit(db, raw_text, now_ph)
         if success:
@@ -696,19 +679,17 @@ def handle_cath_schedule(message):
                 "Or use /active to see your task names."
             )
             return
-
-    # --- NEW ONE-TIME SCHEDULE ---
-    parsed_time, matched_str = parse_schedule_time(raw_text, now_ph)
-    if parsed_time:
-        if parsed_time < now_ph.replace(tzinfo=None):
+    parsed_time_val, matched_str = parse_schedule_time(raw_text, now_ph)
+    if parsed_time_val:
+        if parsed_time_val < now_ph.replace(tzinfo=None):
             bot.reply_to(
                 message,
-                f"⚠️ That time ({parsed_time.strftime('%Y-%m-%d %I:%M %p')}) is already in the past.\n"
+                f"⚠️ That time ({parsed_time_val.strftime('%Y-%m-%d %I:%M %p')}) is already in the past.\n"
                 f"Did you mean a future date? Use /active to see current schedules."
             )
             return
-        event_date = parsed_time.strftime("%Y-%m-%d")
-        event_time = parsed_time.strftime("%I:%M %p")
+        event_date = parsed_time_val.strftime("%Y-%m-%d")
+        event_time = parsed_time_val.strftime("%I:%M %p")
         clean_task = clean_task_text(raw_text, matched_str)
         if is_duplicate(db, clean_task, event_date, event_time):
             bot.reply_to(message, f"⚠️ Already saved: {clean_task} on {event_date} at {event_time}.")
@@ -742,10 +723,7 @@ def handle_cath_schedule(message):
 def handle_recurring_create(message, raw_text: str, recur_type: str):
     db = load_db()
     now_ph = datetime.now(PH_TZ)
-
     t_str = parse_time_only(raw_text) or "08:00 AM"
-
-    # Strip recurrence keywords and time to get the task label
     task_text = raw_text
     task_text = re.sub(r'\beveryday\b|\bdaily\b|\bevery\s+day\b', '', task_text, flags=re.IGNORECASE)
     task_text = re.sub(r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', '', task_text, flags=re.IGNORECASE)
@@ -757,7 +735,6 @@ def handle_recurring_create(message, raw_text: str, recur_type: str):
     task_text = re.sub(r'\b\d{1,2}\s*(?:am|pm)\b', '', task_text, flags=re.IGNORECASE)
     task_text = re.sub(r'\s+', ' ', task_text).strip(" .,")
     task_label = task_text.capitalize() or "Recurring Task"
-
     item = {
         "id": int(time.time() * 1000),
         "task": task_label,
@@ -766,23 +743,17 @@ def handle_recurring_create(message, raw_text: str, recur_type: str):
         "chat_id": message.chat.id,
         "last_notified": None,
     }
-
     if recur_type == "weekly":
         day = detect_recur_weekday(raw_text)
         item["recur_day"] = day or "Monday"
-
     if recur_type == "monthly":
         md = detect_recur_monthday(raw_text)
         item["recur_monthday"] = md or now_ph.day
-
     if recur_type == "yearly":
         item["recur_month"] = now_ph.month
         item["recur_day_num"] = now_ph.day
-
     db["recurring"].append(item)
     save_db(db)
-
-    # Build human-readable schedule description
     if recur_type == "daily":
         sched_desc = f"Every day at {t_str}"
     elif recur_type == "weekly":
@@ -791,7 +762,6 @@ def handle_recurring_create(message, raw_text: str, recur_type: str):
         sched_desc = f"Every month on the {item.get('recur_monthday')} at {t_str}"
     else:
         sched_desc = f"Every year at {t_str}"
-
     bot.reply_to(
         message,
         f"🔁 Recurring Task Saved!\n"
@@ -802,18 +772,13 @@ def handle_recurring_create(message, raw_text: str, recur_type: str):
     )
 
 # ==========================================
-# 18. CREATE SPECIAL EVENT (birthday/anniversary/monthsary)
+# 18. CREATE SPECIAL EVENT
 # ==========================================
 def handle_special_create(message, raw_text: str, special_type: str):
     db = load_db()
     now_ph = datetime.now(PH_TZ)
-
     t_str = parse_time_only(raw_text) or "08:00 AM"
-
-    # Parse the date
     parsed_date_str = parse_date_only(raw_text, now_ph)
-
-    # Strip type keywords + time to get person/label
     label_text = raw_text
     for pat in SPECIAL_TYPES.values():
         label_text = re.sub(pat, '', label_text, flags=re.IGNORECASE)
@@ -826,7 +791,6 @@ def handle_special_create(message, raw_text: str, special_type: str):
     label_text = re.sub(r'\b\d{1,2}\b', '', label_text)
     label_text = re.sub(r'\s+', ' ', label_text).strip(" .,")
     label = label_text.capitalize() or special_type.capitalize()
-
     item = {
         "id": int(time.time() * 1000),
         "label": label,
@@ -835,29 +799,21 @@ def handle_special_create(message, raw_text: str, special_type: str):
         "chat_id": message.chat.id,
         "last_notified": None,
     }
-
     if parsed_date_str:
         dt = datetime.strptime(parsed_date_str, "%Y-%m-%d")
         item["month"] = dt.month
         item["day"] = dt.day
-        item["day_of_month"] = dt.day  # used by monthsary
+        item["day_of_month"] = dt.day
         date_display = dt.strftime("%B %d")
     else:
         item["month"] = now_ph.month
         item["day"] = now_ph.day
         item["day_of_month"] = now_ph.day
         date_display = now_ph.strftime("%B %d")
-
     db["specials"].append(item)
     save_db(db)
-
-    type_labels = {
-        'birthday': 'Birthday',
-        'anniversary': 'Anniversary',
-        'monthsary': 'Monthsary'
-    }
+    type_labels = {'birthday': 'Birthday', 'anniversary': 'Anniversary', 'monthsary': 'Monthsary'}
     recur_note = "every month" if special_type == "monthsary" else "every year"
-
     bot.reply_to(
         message,
         f"🎉 {type_labels[special_type]} Saved!\n"
@@ -869,7 +825,7 @@ def handle_special_create(message, raw_text: str, special_type: str):
     )
 
 # ==========================================
-# 19. /active — SHOW UPCOMING ONE-TIME SCHEDULES
+# 19. /active
 # ==========================================
 @bot.message_handler(commands=['active'])
 def show_active_tasks(message):
@@ -892,7 +848,7 @@ def show_active_tasks(message):
         bot.reply_to(message, "✅ No upcoming schedules. You're free!")
 
 # ==========================================
-# 20. /recurring — LIST ALL RECURRING TASKS (READ)
+# 20. /recurring
 # ==========================================
 @bot.message_handler(commands=['recurring'])
 def show_recurring(message):
@@ -915,9 +871,7 @@ def show_recurring(message):
     bot.reply_to(message, "🔁 Recurring Tasks\n\n" + "\n".join(lines))
 
 # ==========================================
-# 21. /editrecurring — UPDATE RECURRING TASK (UPDATE)
-#     Usage: /editrecurring id:123 time: 9:00 PM
-#            /editrecurring id:123 task: Take vitamins
+# 21. /editrecurring
 # ==========================================
 @bot.message_handler(commands=['editrecurring'])
 def edit_recurring(message):
@@ -932,11 +886,9 @@ def edit_recurring(message):
     if not target:
         bot.reply_to(message, f"🚫 No recurring task with ID {target_id}. Check /recurring.")
         return
-    # Parse new time
     new_time = parse_time_only(query)
     if new_time:
         target["time"] = new_time
-    # Parse new task name
     task_match = re.search(r'task:\s*(.+)', query, re.IGNORECASE)
     if task_match:
         target["task"] = task_match.group(1).strip().capitalize()
@@ -951,20 +903,18 @@ def edit_recurring(message):
     )
 
 # ==========================================
-# 22. /delrecurring — DELETE RECURRING TASK
+# 22. /delrecurring
 # ==========================================
 @bot.message_handler(commands=['delrecurring'])
 def delete_recurring(message):
     query = message.text.replace("/delrecurring", "").strip()
     db = load_db()
     original = len(db.get("recurring", []))
-
     if query.lower() == "all":
         db["recurring"] = []
         save_db(db)
         bot.reply_to(message, f"🗑️ Cleared all {original} recurring task(s).")
         return
-
     id_match = re.search(r'id:(\d+)', query, re.IGNORECASE)
     if id_match:
         target_id = int(id_match.group(1))
@@ -976,8 +926,6 @@ def delete_recurring(message):
         else:
             bot.reply_to(message, f"🚫 No recurring task with ID {target_id}.")
         return
-
-    # keyword match
     db["recurring"] = [r for r in db.get("recurring", []) if query.lower() not in r["task"].lower()]
     deleted = original - len(db["recurring"])
     if deleted:
@@ -987,7 +935,7 @@ def delete_recurring(message):
         bot.reply_to(message, f"🚫 No recurring tasks matching '{query}'.")
 
 # ==========================================
-# 23. /specials — LIST ALL SPECIAL EVENTS (READ)
+# 23. /specials
 # ==========================================
 @bot.message_handler(commands=['specials'])
 def show_specials(message):
@@ -1009,9 +957,7 @@ def show_specials(message):
     bot.reply_to(message, "🎉 Special Events\n\n" + "\n".join(lines))
 
 # ==========================================
-# 24. /editspecial — UPDATE SPECIAL EVENT (UPDATE)
-#     Usage: /editspecial id:123 time: 9:00 AM
-#            /editspecial id:123 label: Cath's Birthday
+# 24. /editspecial
 # ==========================================
 @bot.message_handler(commands=['editspecial'])
 def edit_special(message):
@@ -1043,20 +989,18 @@ def edit_special(message):
     )
 
 # ==========================================
-# 25. /delspecial — DELETE SPECIAL EVENT
+# 25. /delspecial
 # ==========================================
 @bot.message_handler(commands=['delspecial'])
 def delete_special(message):
     query = message.text.replace("/delspecial", "").strip()
     db = load_db()
     original = len(db.get("specials", []))
-
     if query.lower() == "all":
         db["specials"] = []
         save_db(db)
         bot.reply_to(message, f"🗑️ Cleared all {original} special event(s).")
         return
-
     id_match = re.search(r'id:(\d+)', query, re.IGNORECASE)
     if id_match:
         target_id = int(id_match.group(1))
@@ -1068,7 +1012,6 @@ def delete_special(message):
         else:
             bot.reply_to(message, f"🚫 No special event with ID {target_id}.")
         return
-
     db["specials"] = [s for s in db.get("specials", []) if query.lower() not in s["label"].lower()]
     deleted = original - len(db["specials"])
     if deleted:
@@ -1078,7 +1021,7 @@ def delete_special(message):
         bot.reply_to(message, f"🚫 No special events matching '{query}'.")
 
 # ==========================================
-# 26. /delete — ONE-TIME SCHEDULE DELETE (unchanged)
+# 26. /delete
 # ==========================================
 @bot.message_handler(commands=['delete'])
 def delete_task(message):
@@ -1120,7 +1063,7 @@ def delete_task(message):
         bot.reply_to(message, f"🚫 No tasks found matching '{query}'. Check /active.")
 
 # ==========================================
-# 27. /upload — SAVE NOTES/FILES
+# 27. /upload
 # ==========================================
 @bot.message_handler(commands=['upload'], content_types=['text', 'document'])
 def handle_upload(message):
@@ -1140,7 +1083,7 @@ def handle_upload(message):
     bot.reply_to(message, f"✅ Saved '{title}' notes.")
 
 # ==========================================
-# 28. /help — COMMAND REFERENCE
+# 28. /help
 # ==========================================
 @bot.message_handler(commands=['help', 'start'])
 def show_help(message):
@@ -1168,13 +1111,13 @@ def show_help(message):
         "• /delspecial [id:xxx or keyword or all]\n\n"
         "AI CHAT\n"
         "• Ask any question ending with ?\n"
-        "• Uses Gemini → OpenAI → NVIDIA fallback\n\n"
+        "• Uses Gemini -> OpenRouter -> NVIDIA fallback\n\n"
         "NOTES\n"
         "• /upload [title] — save a note or file"
     )
 
 # ==========================================
-# 29. QUESTION FALLBACK — AI OR LOCAL LOOKUP
+# 29. QUESTION FALLBACK
 # ==========================================
 @bot.message_handler(func=lambda m: m.text is not None)
 def smart_question_fallback(message):
@@ -1207,8 +1150,7 @@ def smart_question_fallback(message):
     bot.reply_to(message, reply)
 
 # ==========================================
-# 30. REAL-TIME REMINDER ENGINE
-#     Handles: one-time, recurring, specials
+# 30. REMINDER ENGINE
 # ==========================================
 def reminder_loop():
     print("⏰ Reminder engine started.")
@@ -1218,7 +1160,6 @@ def reminder_loop():
             db = load_db()
             changed = False
 
-            # --- ONE-TIME SCHEDULES ---
             for item in db.get("schedules", []):
                 if item.get("notified"):
                     continue
@@ -1248,7 +1189,6 @@ def reminder_loop():
                         item["warned_24h"] = True
                         changed = True
 
-            # --- RECURRING TASKS ---
             for item in db.get("recurring", []):
                 chat_id = item.get("chat_id")
                 if not chat_id:
@@ -1264,7 +1204,6 @@ def reminder_loop():
                 if last:
                     try:
                         last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M")
-                        # Don't re-fire within 23 hours
                         if (now_ph.replace(tzinfo=None) - last_dt).total_seconds() < 23 * 3600:
                             already_fired_today = True
                     except ValueError:
@@ -1280,7 +1219,6 @@ def reminder_loop():
                     item["last_notified"] = now_ph.strftime("%Y-%m-%d %H:%M")
                     changed = True
 
-            # --- SPECIAL EVENTS ---
             for item in db.get("specials", []):
                 chat_id = item.get("chat_id")
                 if not chat_id:
@@ -1300,11 +1238,8 @@ def reminder_loop():
                             already_fired = True
                     except ValueError:
                         pass
-
                 type_emoji = {'birthday': '🎂', 'anniversary': '💍', 'monthsary': '💕'}
                 emoji = type_emoji.get(item["special_type"], "🎉")
-
-                # 24h advance warning
                 if 23 * 3600 + 55 * 60 <= diff <= 24 * 3600 + 5 * 60:
                     last_warn = item.get("last_warned_24h")
                     if not last_warn or last_warn != fire_dt_aware.strftime("%Y-%m-%d"):
@@ -1315,8 +1250,6 @@ def reminder_loop():
                             f"📅 {fire_dt_aware.strftime('%B %d')} at {item.get('time')}")
                         item["last_warned_24h"] = fire_dt_aware.strftime("%Y-%m-%d")
                         changed = True
-
-                # Fire on the day
                 if -30 <= diff <= 60 and not already_fired:
                     type_label = item["special_type"].capitalize()
                     bot.send_message(chat_id,
@@ -1326,7 +1259,6 @@ def reminder_loop():
                     item["last_notified"] = now_ph.strftime("%Y-%m-%d %H:%M")
                     changed = True
 
-            # Saturday weekly audit (unchanged)
             if now_ph.weekday() == 5 and now_ph.hour == 9 and now_ph.minute == 0:
                 chat_ids_seen = set()
                 audit_items = []
