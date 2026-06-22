@@ -10,8 +10,6 @@ import threading
 from datetime import datetime, timedelta
 import dateparser
 import pytz
-from dateparser.search import search_dates
-from google import genai
 
 # ==========================================
 # 1. INITIALIZATION & CREDENTIALS
