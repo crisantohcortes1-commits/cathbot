@@ -24,7 +24,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 DATA_FILE = "bot_database.json"
 PH_TZ     = pytz.timezone('Asia/Manila')
 
-# AI provider fallback order: gemini → openrouter → nvidia
+# AI provider fallback order: gemini -> openrouter -> nvidia
 AI_PROVIDERS = []
 if GEMINI_API_KEY:
     AI_PROVIDERS.append("gemini")
@@ -32,6 +32,9 @@ if OPENROUTER_API_KEY:
     AI_PROVIDERS.append("openrouter")
 if NVIDIA_API_KEY:
     AI_PROVIDERS.append("nvidia")
+
+# In-memory state for multi-step /edit disambiguation, keyed by chat_id.
+PENDING_EDITS = {}
 
 # ==========================================
 # 2. DATABASE HELPERS
@@ -44,7 +47,13 @@ def load_db():
             data = json.load(f)
         except json.JSONDecodeError:
             return {"notes": {}, "schedules": [], "classes": {}, "recurring": [], "specials": []}
-    data.setdefault("notes", {})
+    # "notes" is a per-chat-scoped LIST of upload records (not a dict keyed
+    # by title) so that the same title (e.g. "math") can exist independently
+    # in different groups, and so every record can carry its own chat_id.
+    notes = data.get("notes")
+    if not isinstance(notes, list):
+        notes = []  # migrate away from the old unscoped dict format
+    data["notes"] = notes
     data.setdefault("schedules", [])
     data.setdefault("classes", {})
     data.setdefault("recurring", [])
@@ -54,6 +63,25 @@ def load_db():
 def save_db(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
+
+# ------------------------------------------
+# 2A. PER-CHAT SECURITY / SCOPING HELPERS
+# ------------------------------------------
+# Every schedule / recurring task / special event is tagged with the chat_id
+# it was created in (group or private chat). All read & write commands below
+# MUST filter through these helpers so that data never leaks between chats.
+
+def get_chat_schedules(db: dict, chat_id) -> list:
+    return [s for s in db.get("schedules", []) if s.get("chat_id") == chat_id]
+
+def get_chat_recurring(db: dict, chat_id) -> list:
+    return [r for r in db.get("recurring", []) if r.get("chat_id") == chat_id]
+
+def get_chat_specials(db: dict, chat_id) -> list:
+    return [s for s in db.get("specials", []) if s.get("chat_id") == chat_id]
+
+def get_chat_notes(db: dict, chat_id) -> list:
+    return [n for n in db.get("notes", []) if n.get("chat_id") == chat_id]
 
 # ==========================================
 # 3. AI FALLBACK ENGINE
@@ -121,10 +149,12 @@ def ask_ai(prompt: str) -> str:
 SCHEDULE_SIGNALS = [
     r'\bsched\b', r'\bschedule\b', r'\bremind\b', r'\balert\b',
     r'\btell\b', r'\bnotify\b', r'\bat\s+\d', r'\b\d+(am|pm)\b',
-    r'\btoday\b', r'\btomorrow\b', r'\bnext\b', r'\btmr\b', r'\btmrw\b',
+    r'\btoday\b', r'\btomorrow\b', r'\bnext\b', r'\btmr\b', r'\btmrw\b', r'\btom\b',
     r'\b\d{4}-\d{2}-\d{2}\b',
     r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b',
+    r'\b\d{1,2}-\d{1,2}-\d{4}\b',
     r'\b\d{1,2}:\d{2}\b',
+    r'\b(mon|tue|wed|thu|fri|sat|sun)\b',
 ]
 
 CONVERSATIONAL_PATTERNS = [
@@ -147,10 +177,10 @@ def is_real_schedule_command(text: str) -> bool:
     return True
 
 # ==========================================
-# 5. DUPLICATE DETECTION
+# 5. DUPLICATE DETECTION (scoped to one chat)
 # ==========================================
-def is_duplicate(db: dict, task: str, date: str, time_str: str) -> bool:
-    for item in db.get("schedules", []):
+def is_duplicate(db: dict, task: str, date: str, time_str: str, chat_id) -> bool:
+    for item in get_chat_schedules(db, chat_id):
         if (
             item["task"].lower() == task.lower()
             and item["date"] == date
@@ -178,10 +208,12 @@ DATE_SIGNALS = [
     r'\bdate\b', r'\bday\b',
     r'\b\d{4}-\d{2}-\d{2}\b',
     r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b',
+    r'\b\d{1,2}-\d{1,2}-\d{4}\b',
     r'\bmonday\b', r'\btuesday\b', r'\bwednesday\b', r'\bthursday\b',
     r'\bfriday\b', r'\bsaturday\b', r'\bsunday\b',
+    r'\b(mon|tue|wed|thu|fri|sat|sun)\b',
     r'\btomorrow\b', r'\btoday\b', r'\bnext\b',
-    r'\btmr\b', r'\btmrw\b',
+    r'\btmr\b', r'\btmrw\b', r'\btom\b',
     r'\bjanuary\b', r'\bfebruary\b', r'\bmarch\b', r'\bapril\b',
     r'\bmay\b', r'\bjune\b', r'\bjuly\b', r'\baugust\b',
     r'\bseptember\b', r'\boctober\b', r'\bnovember\b', r'\bdecember\b',
@@ -216,49 +248,61 @@ def detect_what_to_change(text: str) -> tuple:
 TASK_EXTRACTION_NOISE = {
     'change', 'update', 'edit', 'modify', 'move', 'reschedule', 'reset', 'set',
     'to', 'at', 'the', 'it', 'a', 'an', 'sched', 'schedule',
-    'am', 'pm', 'today', 'tomorrow', 'tmr', 'tmrw', 'this', 'now', 'in', 'on',
+    'am', 'pm', 'today', 'tomorrow', 'tmr', 'tmrw', 'tom', 'this', 'now', 'in', 'on',
     'date', 'time', 'day', 'from', 'for', 'my', 'please',
     'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+    'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun',
     'january', 'february', 'march', 'april', 'may', 'june', 'july',
     'august', 'september', 'october', 'november', 'december',
 }
 
 def extract_task_keywords(raw_text: str) -> list:
     text = raw_text.lower()
-    text = re.sub(r'\b\d{1,2}:\d{2}\s*(?:am|pm)\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b\d{1,2}:\d{2}\s*(?:am|pm)?\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\b\d{1,2}\s*(?:am|pm)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', '', text)
     text = re.sub(r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b', '', text)
+    text = re.sub(r'\b\d{1,2}-\d{1,2}-\d{4}\b', '', text)
     quoted = re.search(r'["\'](.+?)["\']', text)
     if quoted:
         return quoted.group(1).lower().split()
     words = re.split(r'\W+', text)
     return [w for w in words if w and w not in TASK_EXTRACTION_NOISE and len(w) > 2]
 
-def find_best_matching_task(db: dict, keywords: list) -> dict:
-    if not db["schedules"]:
+def find_best_matching_task(schedules: list, keywords: list):
+    """Operates on an already chat-scoped list of schedules."""
+    if not schedules:
         return None
     if not keywords:
-        return db["schedules"][-1]
+        return schedules[-1]
     target = None
     best_score = 0
-    for item in db["schedules"]:
+    for item in schedules:
         task_lower = item["task"].lower()
         score = sum(1 for w in keywords if w in task_lower)
         if score > best_score:
             best_score = score
             target = item
-    return target if target else db["schedules"][-1]
+    return target if target else schedules[-1]
+
+def find_matching_tasks(schedules: list, keywords: list) -> list:
+    """Return ALL schedules (chat-scoped) whose task text contains any keyword.
+    If no keywords given, returns every chat-scoped schedule."""
+    if not keywords:
+        return list(schedules)
+    matches = [s for s in schedules if any(w in s["task"].lower() for w in keywords)]
+    return matches
 
 # ==========================================
-# 9. PATCH EDIT — MUTATE ONLY WHAT CHANGED
+# 9. PATCH EDIT — MUTATE ONLY WHAT CHANGED (scoped to one chat)
 # ==========================================
-def try_patch_edit(db: dict, raw_text: str, now_ph: datetime) -> tuple:
-    if not db["schedules"]:
+def try_patch_edit(db: dict, raw_text: str, now_ph: datetime, chat_id) -> tuple:
+    chat_schedules = get_chat_schedules(db, chat_id)
+    if not chat_schedules:
         return False, ""
     change_date, change_time = detect_what_to_change(raw_text)
     keywords = extract_task_keywords(raw_text)
-    target = find_best_matching_task(db, keywords)
+    target = find_best_matching_task(chat_schedules, keywords)
     if target is None:
         return False, ""
     old_date = target["date"]
@@ -296,15 +340,41 @@ def try_patch_edit(db: dict, raw_text: str, now_ph: datetime) -> tuple:
 # ==========================================
 # 10. ISOLATED DATE PARSER
 # ==========================================
+WEEKDAY_ABBREV = {
+    'mon': 'monday', 'tue': 'tuesday', 'tues': 'tuesday', 'wed': 'wednesday',
+    'thu': 'thursday', 'thur': 'thursday', 'thurs': 'thursday', 'fri': 'friday',
+    'sat': 'saturday', 'sun': 'sunday',
+}
+
+MONTH_NAME_MAP = {
+    'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
+    'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6, 'july': 7, 'jul': 7,
+    'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'sept': 9,
+    'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12,
+}
+
 def parse_date_only(raw_text: str, now_ph: datetime) -> str:
     text = fuzzy_correct(raw_text)
     now_naive = now_ph.replace(tzinfo=None)
-    iso_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
+
+    # 1. ISO format: YYYY-MM-DD
+    iso_match = re.search(r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', text)
     if iso_match:
         try:
-            return datetime.strptime(iso_match.group(1), "%Y-%m-%d").strftime("%Y-%m-%d")
+            return datetime(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3))).strftime("%Y-%m-%d")
         except ValueError:
             pass
+
+    # 2. Dash MM-DD-YYYY (e.g. 06-30-2026)
+    dash_match = re.search(r'\b(\d{1,2})-(\d{1,2})-(\d{4})\b', text)
+    if dash_match:
+        m, d, y = int(dash_match.group(1)), int(dash_match.group(2)), int(dash_match.group(3))
+        try:
+            return datetime(y, m, d).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 3. Slash format: M/D[/YYYY]
     slash_match = re.search(r'\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b', text)
     if slash_match:
         m, d = int(slash_match.group(1)), int(slash_match.group(2))
@@ -315,45 +385,52 @@ def parse_date_only(raw_text: str, now_ph: datetime) -> str:
             return datetime(y, m, d).strftime("%Y-%m-%d")
         except ValueError:
             pass
+
     stripped = re.sub(r'\b\d{1,2}:\d{2}\s*(?:am|pm)?\b', '', text, flags=re.IGNORECASE)
     stripped = re.sub(r'\b\d{1,2}\s*(?:am|pm)\b', '', stripped, flags=re.IGNORECASE)
+
+    # 4. today / tomorrow ("tom" is fuzzy-corrected to "tomorrow")
     for pat, offset in [(r'\btomorrow\b', 1), (r'\btoday\b', 0)]:
         if re.search(pat, stripped, re.IGNORECASE):
             return (now_naive + timedelta(days=offset)).strftime("%Y-%m-%d")
+
+    # 5. Weekday names — full and abbreviated (mon, tue, wed, thu, fri, sat, sun)
     weekday_map = {
         'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
         'friday': 4, 'saturday': 5, 'sunday': 6
     }
-    for name, wday in weekday_map.items():
+    weekday_terms = list(weekday_map.items())
+    for abbr, full in WEEKDAY_ABBREV.items():
+        weekday_terms.append((abbr, weekday_map[full]))
+    for name, wday in weekday_terms:
         if re.search(rf'\b{name}\b', stripped, re.IGNORECASE):
             days_ahead = (wday - now_naive.weekday() + 7) % 7
             if days_ahead == 0:
                 days_ahead = 7
             return (now_naive + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-    month_map = {
-        'january': 1, 'february': 2, 'march': 3, 'april': 4,
-        'may': 5, 'june': 6, 'july': 7, 'august': 8,
-        'september': 9, 'october': 10, 'november': 11, 'december': 12
-    }
+
+    # 6. Month name + day, with optional year (e.g. "June 30 2026", "Jun 30", "30 June 2026")
+    month_alt = '|'.join(MONTH_NAME_MAP.keys())
     month_day = re.search(
-        r'\b(' + '|'.join(month_map.keys()) + r')\s+(\d{1,2})\b'
-        r'|\b(\d{1,2})\s+(' + '|'.join(month_map.keys()) + r')\b',
+        r'\b(' + month_alt + r')\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\b'
+        r'|\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_alt + r')(?:,?\s+(\d{4}))?\b',
         stripped, re.IGNORECASE
     )
     if month_day:
         groups = month_day.groups()
         if groups[0]:
-            month, day = month_map[groups[0].lower()], int(groups[1])
+            month, day, year_group = MONTH_NAME_MAP[groups[0].lower()], int(groups[1]), groups[2]
         else:
-            month, day = month_map[groups[3].lower()], int(groups[2])
-        year = now_naive.year
+            month, day, year_group = MONTH_NAME_MAP[groups[4].lower()], int(groups[3]), groups[5]
+        year = int(year_group) if year_group else now_naive.year
         try:
             candidate = datetime(year, month, day)
-            if candidate.date() < now_naive.date():
+            if not year_group and candidate.date() < now_naive.date():
                 candidate = datetime(year + 1, month, day)
             return candidate.strftime("%Y-%m-%d")
         except ValueError:
             pass
+
     return None
 
 # ==========================================
@@ -395,6 +472,7 @@ SPELLING_FIXES = {
     r'\btomoro\b': 'tomorrow',
     r'\btmr\b': 'tomorrow',
     r'\btmrw\b': 'tomorrow',
+    r'\btom\b': 'tomorrow',
     r'\btodat\b': 'today',
     r'\btodey\b': 'today',
     r'(\d)(am|pm)\b': r'\1 \2',
@@ -413,34 +491,38 @@ def fuzzy_correct(text: str) -> str:
 def parse_schedule_time(raw_text: str, now_ph: datetime) -> tuple:
     corrected = fuzzy_correct(raw_text)
     now_naive = now_ph.replace(tzinfo=None)
+
+    # ------------------------------------------------------------------
+    # PRIORITY PASS: explicit date formats (ISO, dash MM-DD-YYYY, slash,
+    # month-name [+year], weekday, today/tomorrow) always win over the
+    # fuzzy dateparser fallback below. This fixes cases where a clearly
+    # specified date (e.g. "06-30-2026") was getting ignored in favor of
+    # "today" because the free-text parser got confused by other words.
+    # ------------------------------------------------------------------
+    explicit_date_str = parse_date_only(raw_text, now_ph)
+    explicit_time_str = parse_time_only(corrected)
+    if explicit_date_str:
+        try:
+            base_date = datetime.strptime(explicit_date_str, "%Y-%m-%d")
+        except ValueError:
+            base_date = None
+        if base_date:
+            if explicit_time_str:
+                t_obj = datetime.strptime(explicit_time_str, "%I:%M %p")
+                final_dt = datetime(base_date.year, base_date.month, base_date.day, t_obj.hour, t_obj.minute)
+            else:
+                final_dt = datetime(base_date.year, base_date.month, base_date.day, 8, 0)
+            # matched_str is only used as a best-effort hint for clean_task_text;
+            # clean_task_text itself strips date/time tokens with its own
+            # comprehensive patterns, so an empty/loose hint here is safe.
+            return final_dt, ""
+
     time_re = re.compile(
         r'\b(\d{1,2}):(\d{2})\s*(am|pm)\b'
         r'|\b(\d{1,2})\s*(am|pm)\b'
         r'|\b(\d{1,2}):(\d{2})\b',
         re.IGNORECASE
     )
-    iso_date_re = re.compile(r'\b(\d{4}-\d{2}-\d{2})\b')
-    iso_match = iso_date_re.search(corrected)
-    if iso_match:
-        iso_str = iso_match.group(1)
-        try:
-            base_date = datetime.strptime(iso_str, "%Y-%m-%d").date()
-        except ValueError:
-            base_date = None
-        if base_date:
-            time_match = time_re.search(corrected)
-            if time_match:
-                parsed_t = dateparser.parse(
-                    time_match.group(0).strip(),
-                    settings={'PREFER_DATES_FROM': 'current_period',
-                              'TIMEZONE': 'Asia/Manila', 'RETURN_AS_TIMEZONE_AWARE': False}
-                )
-                if parsed_t:
-                    final_dt = datetime(base_date.year, base_date.month, base_date.day,
-                                        parsed_t.hour, parsed_t.minute)
-                    return final_dt, f"{iso_str} {time_match.group(0)}"
-            final_dt = datetime(base_date.year, base_date.month, base_date.day, 8, 0)
-            return final_dt, iso_str
     relative_patterns = [
         (r'\btomorrow\b', 1), (r'\btoday\b', 0), (r'\bthis\b', 0),
     ]
@@ -464,7 +546,7 @@ def parse_schedule_time(raw_text: str, now_ph: datetime) -> tuple:
             final_dt = datetime(target_date.year, target_date.month, target_date.day,
                                 parsed_t.hour, parsed_t.minute)
             return final_dt, f"{date_word_matched} {time_match.group(0)}"
-    if time_match and day_offset is None and not iso_match:
+    if time_match and day_offset is None:
         parsed_t = dateparser.parse(
             time_match.group(0).strip(),
             settings={'PREFER_DATES_FROM': 'current_period',
@@ -504,15 +586,23 @@ def parse_schedule_time(raw_text: str, now_ph: datetime) -> tuple:
 # ==========================================
 def clean_task_text(raw_text: str, matched_date_str: str) -> str:
     task = raw_text.replace(matched_date_str, "") if matched_date_str else raw_text
+    month_alt = '|'.join(MONTH_NAME_MAP.keys())
     noise_patterns = [
         r'\btoday\b', r'\btomorrow\b', r'\bthis\b', r'\bnow\b',
         r'\btommorow\b', r'\btommorrow\b', r'\btomorow\b', r'\btomoro\b',
-        r'\btmr\b', r'\btmrw\b',
+        r'\btmr\b', r'\btmrw\b', r'\btom\b',
         r'\bat\b', r'\bin\b', r'\bon\b',
-        r'\b\d{4}-\d{2}-\d{2}\b',
+        r'\b\d{4}-\d{1,2}-\d{1,2}\b',
+        r'\b\d{1,2}-\d{1,2}-\d{4}\b',
+        r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b',
         r'\b\d{1,2}:\d{2}\s*(?:am|pm)\b',
         r'\b\d{1,2}\s*(?:am|pm)\b',
         r'\b\d{1,2}:\d{2}\b',
+        r'\b(' + month_alt + r')\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?\b',
+        r'\b\d{1,2}(?:st|nd|rd|th)?\s+(' + month_alt + r')(?:,?\s+\d{4})?\b',
+        r'\bmonday\b', r'\btuesday\b', r'\bwednesday\b', r'\bthursday\b',
+        r'\bfriday\b', r'\bsaturday\b', r'\bsunday\b',
+        r'\bmon\b', r'\btue\b', r'\btues\b', r'\bwed\b', r'\bthu\b', r'\bthur\b', r'\bthurs\b', r'\bfri\b', r'\bsat\b', r'\bsun\b',
         r'\bpm\b', r'\bam\b', r'\bsched\b', r'\bschedule\b',
         r'\bcreate sched to\b', r'\bchange it to\b', r'\bremind me to\b',
         r'\btell\b', r'\bchange\b', r'\bupdate\b', r',',
@@ -526,14 +616,24 @@ def clean_task_text(raw_text: str, matched_date_str: str) -> str:
 # 14. RECURRING TASK HELPERS
 # ==========================================
 RECUR_TYPES = {
-    'daily':   r'\beveryday\b|\bdaily\b|\bevery\s+day\b',
-    'weekly':  r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\bweekly\b',
-    'monthly': r'\bevery\s+month\b|\bmonthly\b|\bevery\s+\d{1,2}(st|nd|rd|th)?\b',
+    # NOTE: ordered dict-wise — daily is checked first. "each" is treated as a
+    # daily signal (e.g. "...every 3:30pm each timestamp" -> daily).
+    'daily':   r'\beveryday\b|\bdaily\b|\bevery\s+day\b|\beach\b',
+    'weekly':  r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b|\bweekly\b',
+    # Monthly day-of-month reference now REQUIRES an ordinal suffix
+    # (1st/2nd/3rd/4th...) so that a bare "every 3:30" (a TIME, not a day
+    # number) never gets misread as "every 3rd of the month".
+    'monthly': r'\bevery\s+month\b|\bmonthly\b|\bevery\s+\d{1,2}(?:st|nd|rd|th)\b',
     'yearly':  r'\bevery\s+year\b|\bannually\b|\byearly\b',
 }
 
 def detect_recur_type(text: str) -> str:
     t = text.lower()
+    # Strip out time-of-day tokens BEFORE testing the recurrence patterns.
+    # This is what prevents "every 3:30 pm" from being parsed as "every 3"
+    # (a monthly day-of-month reference) by the monthly regex.
+    t = re.sub(r'\b\d{1,2}:\d{2}\s*(?:am|pm)?\b', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\b\d{1,2}\s*(?:am|pm)\b', '', t, flags=re.IGNORECASE)
     for rtype, pat in RECUR_TYPES.items():
         if re.search(pat, t):
             return rtype
@@ -545,6 +645,9 @@ def detect_recur_weekday(text: str) -> str:
     for d in days:
         if re.search(rf'\b{d}\b', t):
             return d.capitalize()
+    for abbr, full in WEEKDAY_ABBREV.items():
+        if re.search(rf'\b{abbr}\b', t):
+            return full.capitalize()
     return None
 
 def detect_recur_monthday(text: str) -> int:
@@ -645,11 +748,19 @@ def next_special_date(item: dict, now_ph: datetime) -> datetime:
     return datetime(now_naive.year + 1, month, day, t_obj.hour, t_obj.minute)
 
 # ==========================================
-# 16. MAIN SCHEDULE HANDLER (- prefix)
+# 16. MAIN SCHEDULE HANDLER (- prefix), supports bulk multi-line paste
 # ==========================================
-@bot.message_handler(func=lambda m: m.text and m.text.strip().startswith("-"))
+@bot.message_handler(func=lambda m: m.text and any(l.strip().startswith("-") for l in m.text.split("\n")))
 def handle_cath_schedule(message):
-    raw_text = message.text.strip()[1:].replace("@", "").strip()
+    lines = [l.strip() for l in message.text.split("\n") if l.strip().startswith("-")]
+    if not lines:
+        return
+    for line in lines:
+        raw_text = line[1:].replace("@", "").strip()
+        if raw_text:
+            process_schedule_line(message, raw_text)
+
+def process_schedule_line(message, raw_text: str):
     recur_type = detect_recur_type(raw_text)
     if recur_type:
         handle_recurring_create(message, raw_text, recur_type)
@@ -661,10 +772,11 @@ def handle_cath_schedule(message):
     if not is_real_schedule_command(raw_text):
         return
     db = load_db()
+    chat_id = message.chat.id
     now_ph = datetime.now(PH_TZ)
     is_edit = detect_edit_intent(raw_text)
     if is_edit:
-        success, edit_msg = try_patch_edit(db, raw_text, now_ph)
+        success, edit_msg = try_patch_edit(db, raw_text, now_ph, chat_id)
         if success:
             save_db(db)
             bot.reply_to(message, edit_msg)
@@ -691,7 +803,7 @@ def handle_cath_schedule(message):
         event_date = parsed_time_val.strftime("%Y-%m-%d")
         event_time = parsed_time_val.strftime("%I:%M %p")
         clean_task = clean_task_text(raw_text, matched_str)
-        if is_duplicate(db, clean_task, event_date, event_time):
+        if is_duplicate(db, clean_task, event_date, event_time, chat_id):
             bot.reply_to(message, f"⚠️ Already saved: {clean_task} on {event_date} at {event_time}.")
             return
         db["schedules"].append({
@@ -699,7 +811,7 @@ def handle_cath_schedule(message):
             "date": event_date,
             "time": event_time,
             "task": clean_task,
-            "chat_id": message.chat.id,
+            "chat_id": chat_id,
             "notified": False,
         })
         save_db(db)
@@ -725,9 +837,9 @@ def handle_recurring_create(message, raw_text: str, recur_type: str):
     now_ph = datetime.now(PH_TZ)
     t_str = parse_time_only(raw_text) or "08:00 AM"
     task_text = raw_text
-    task_text = re.sub(r'\beveryday\b|\bdaily\b|\bevery\s+day\b', '', task_text, flags=re.IGNORECASE)
-    task_text = re.sub(r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', '', task_text, flags=re.IGNORECASE)
-    task_text = re.sub(r'\bevery\s+month\b|\bmonthly\b|\bevery\s+\d{1,2}(?:st|nd|rd|th)?\b', '', task_text, flags=re.IGNORECASE)
+    task_text = re.sub(r'\beveryday\b|\bdaily\b|\bevery\s+day\b|\beach\b', '', task_text, flags=re.IGNORECASE)
+    task_text = re.sub(r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b', '', task_text, flags=re.IGNORECASE)
+    task_text = re.sub(r'\bevery\s+month\b|\bmonthly\b|\bevery\s+\d{1,2}(?:st|nd|rd|th)\b', '', task_text, flags=re.IGNORECASE)
     task_text = re.sub(r'\bevery\s+year\b|\bannually\b|\byearly\b', '', task_text, flags=re.IGNORECASE)
     task_text = re.sub(r'\bweekly\b', '', task_text, flags=re.IGNORECASE)
     task_text = re.sub(r'\bremind\s+me\s+to\b|\bremind\s+to\b', '', task_text, flags=re.IGNORECASE)
@@ -784,9 +896,10 @@ def handle_special_create(message, raw_text: str, special_type: str):
         label_text = re.sub(pat, '', label_text, flags=re.IGNORECASE)
     label_text = re.sub(r'\b\d{1,2}:\d{2}\s*(?:am|pm)\b', '', label_text, flags=re.IGNORECASE)
     label_text = re.sub(r'\b\d{1,2}\s*(?:am|pm)\b', '', label_text, flags=re.IGNORECASE)
-    label_text = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', '', label_text)
+    label_text = re.sub(r'\b\d{4}-\d{1,2}-\d{1,2}\b', '', label_text)
+    label_text = re.sub(r'\b\d{1,2}-\d{1,2}-\d{4}\b', '', label_text)
     label_text = re.sub(r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b', '', label_text)
-    month_names = r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b'
+    month_names = r'\b(' + '|'.join(MONTH_NAME_MAP.keys()) + r')\b'
     label_text = re.sub(month_names + r'\s*\d{0,2}', '', label_text, flags=re.IGNORECASE)
     label_text = re.sub(r'\b\d{1,2}\b', '', label_text)
     label_text = re.sub(r'\s+', ' ', label_text).strip(" .,")
@@ -825,15 +938,16 @@ def handle_special_create(message, raw_text: str, special_type: str):
     )
 
 # ==========================================
-# 19. /active
+# 19. /active (scoped to the requesting chat)
 # ==========================================
 @bot.message_handler(commands=['active'])
 def show_active_tasks(message):
     db = load_db()
+    chat_id = message.chat.id
     now_ph = datetime.now(PH_TZ).replace(tzinfo=None)
     cutoff = now_ph + timedelta(days=90)
     active_list = []
-    for item in db.get("schedules", []):
+    for item in get_chat_schedules(db, chat_id):
         try:
             item_dt = datetime.strptime(f"{item['date']} {item.get('time', '12:00 AM')}", "%Y-%m-%d %I:%M %p")
             if now_ph <= item_dt <= cutoff:
@@ -848,12 +962,12 @@ def show_active_tasks(message):
         bot.reply_to(message, "✅ No upcoming schedules. You're free!")
 
 # ==========================================
-# 20. /recurring
+# 20. /recurring (scoped)
 # ==========================================
 @bot.message_handler(commands=['recurring'])
 def show_recurring(message):
     db = load_db()
-    items = db.get("recurring", [])
+    items = get_chat_recurring(db, message.chat.id)
     if not items:
         bot.reply_to(message, "🔁 No recurring tasks saved.\nTry: -remind me to take meds 8pm everyday")
         return
@@ -871,7 +985,7 @@ def show_recurring(message):
     bot.reply_to(message, "🔁 Recurring Tasks\n\n" + "\n".join(lines))
 
 # ==========================================
-# 21. /editrecurring
+# 21. /editrecurring (scoped)
 # ==========================================
 @bot.message_handler(commands=['editrecurring'])
 def edit_recurring(message):
@@ -882,9 +996,10 @@ def edit_recurring(message):
         return
     target_id = int(id_match.group(1))
     db = load_db()
-    target = next((r for r in db["recurring"] if r.get("id") == target_id), None)
+    chat_id = message.chat.id
+    target = next((r for r in db["recurring"] if r.get("id") == target_id and r.get("chat_id") == chat_id), None)
     if not target:
-        bot.reply_to(message, f"🚫 No recurring task with ID {target_id}. Check /recurring.")
+        bot.reply_to(message, f"🚫 No recurring task with ID {target_id} in this chat. Check /recurring.")
         return
     new_time = parse_time_only(query)
     if new_time:
@@ -903,31 +1018,35 @@ def edit_recurring(message):
     )
 
 # ==========================================
-# 22. /delrecurring
+# 22. /delrecurring (scoped)
 # ==========================================
 @bot.message_handler(commands=['delrecurring'])
 def delete_recurring(message):
     query = message.text.replace("/delrecurring", "").strip()
     db = load_db()
-    original = len(db.get("recurring", []))
+    chat_id = message.chat.id
+    chat_recurring_ids = {r.get("id") for r in get_chat_recurring(db, chat_id)}
+    original = len(chat_recurring_ids)
     if query.lower() == "all":
-        db["recurring"] = []
+        db["recurring"] = [r for r in db.get("recurring", []) if r.get("chat_id") != chat_id]
         save_db(db)
-        bot.reply_to(message, f"🗑️ Cleared all {original} recurring task(s).")
+        bot.reply_to(message, f"🗑️ Cleared all {original} recurring task(s) for this chat.")
         return
     id_match = re.search(r'id:(\d+)', query, re.IGNORECASE)
     if id_match:
         target_id = int(id_match.group(1))
-        db["recurring"] = [r for r in db["recurring"] if r.get("id") != target_id]
-        deleted = original - len(db["recurring"])
+        before = len(db["recurring"])
+        db["recurring"] = [r for r in db["recurring"] if not (r.get("id") == target_id and r.get("chat_id") == chat_id)]
+        deleted = before - len(db["recurring"])
         save_db(db)
         if deleted:
             bot.reply_to(message, f"🗑️ Deleted recurring task ID {target_id}.")
         else:
-            bot.reply_to(message, f"🚫 No recurring task with ID {target_id}.")
+            bot.reply_to(message, f"🚫 No recurring task with ID {target_id} in this chat.")
         return
-    db["recurring"] = [r for r in db.get("recurring", []) if query.lower() not in r["task"].lower()]
-    deleted = original - len(db["recurring"])
+    before = len(db.get("recurring", []))
+    db["recurring"] = [r for r in db.get("recurring", []) if not (r.get("chat_id") == chat_id and query.lower() in r["task"].lower())]
+    deleted = before - len(db["recurring"])
     if deleted:
         save_db(db)
         bot.reply_to(message, f"🗑️ Deleted {deleted} recurring task(s) matching '{query}'.")
@@ -935,12 +1054,12 @@ def delete_recurring(message):
         bot.reply_to(message, f"🚫 No recurring tasks matching '{query}'.")
 
 # ==========================================
-# 23. /specials
+# 23. /specials (scoped)
 # ==========================================
 @bot.message_handler(commands=['specials'])
 def show_specials(message):
     db = load_db()
-    items = db.get("specials", [])
+    items = get_chat_specials(db, message.chat.id)
     if not items:
         bot.reply_to(message, "🎉 No special events saved.\nTry: -birthday mico june 26 8am")
         return
@@ -957,7 +1076,7 @@ def show_specials(message):
     bot.reply_to(message, "🎉 Special Events\n\n" + "\n".join(lines))
 
 # ==========================================
-# 24. /editspecial
+# 24. /editspecial (scoped)
 # ==========================================
 @bot.message_handler(commands=['editspecial'])
 def edit_special(message):
@@ -968,9 +1087,10 @@ def edit_special(message):
         return
     target_id = int(id_match.group(1))
     db = load_db()
-    target = next((s for s in db["specials"] if s.get("id") == target_id), None)
+    chat_id = message.chat.id
+    target = next((s for s in db["specials"] if s.get("id") == target_id and s.get("chat_id") == chat_id), None)
     if not target:
-        bot.reply_to(message, f"🚫 No special event with ID {target_id}. Check /specials.")
+        bot.reply_to(message, f"🚫 No special event with ID {target_id} in this chat. Check /specials.")
         return
     new_time = parse_time_only(query)
     if new_time:
@@ -989,31 +1109,34 @@ def edit_special(message):
     )
 
 # ==========================================
-# 25. /delspecial
+# 25. /delspecial (scoped)
 # ==========================================
 @bot.message_handler(commands=['delspecial'])
 def delete_special(message):
     query = message.text.replace("/delspecial", "").strip()
     db = load_db()
-    original = len(db.get("specials", []))
+    chat_id = message.chat.id
+    original = len(get_chat_specials(db, chat_id))
     if query.lower() == "all":
-        db["specials"] = []
+        db["specials"] = [s for s in db.get("specials", []) if s.get("chat_id") != chat_id]
         save_db(db)
-        bot.reply_to(message, f"🗑️ Cleared all {original} special event(s).")
+        bot.reply_to(message, f"🗑️ Cleared all {original} special event(s) for this chat.")
         return
     id_match = re.search(r'id:(\d+)', query, re.IGNORECASE)
     if id_match:
         target_id = int(id_match.group(1))
-        db["specials"] = [s for s in db["specials"] if s.get("id") != target_id]
-        deleted = original - len(db["specials"])
+        before = len(db["specials"])
+        db["specials"] = [s for s in db["specials"] if not (s.get("id") == target_id and s.get("chat_id") == chat_id)]
+        deleted = before - len(db["specials"])
         save_db(db)
         if deleted:
             bot.reply_to(message, f"🗑️ Deleted special event ID {target_id}.")
         else:
-            bot.reply_to(message, f"🚫 No special event with ID {target_id}.")
+            bot.reply_to(message, f"🚫 No special event with ID {target_id} in this chat.")
         return
-    db["specials"] = [s for s in db.get("specials", []) if query.lower() not in s["label"].lower()]
-    deleted = original - len(db["specials"])
+    before = len(db.get("specials", []))
+    db["specials"] = [s for s in db.get("specials", []) if not (s.get("chat_id") == chat_id and query.lower() in s["label"].lower())]
+    deleted = before - len(db["specials"])
     if deleted:
         save_db(db)
         bot.reply_to(message, f"🗑️ Deleted {deleted} special event(s) matching '{query}'.")
@@ -1021,7 +1144,7 @@ def delete_special(message):
         bot.reply_to(message, f"🚫 No special events matching '{query}'.")
 
 # ==========================================
-# 26. /delete
+# 26. /delete (scoped)
 # ==========================================
 @bot.message_handler(commands=['delete'])
 def delete_task(message):
@@ -1037,25 +1160,28 @@ def delete_task(message):
         )
         return
     db = load_db()
-    original_count = len(db.get("schedules", []))
+    chat_id = message.chat.id
+    original_count = len(get_chat_schedules(db, chat_id))
     if query.lower() == "all":
-        db["schedules"] = []
+        db["schedules"] = [s for s in db.get("schedules", []) if s.get("chat_id") != chat_id]
         save_db(db)
-        bot.reply_to(message, f"🗑️ Cleared all {original_count} scheduled task(s).")
+        bot.reply_to(message, f"🗑️ Cleared all {original_count} scheduled task(s) for this chat.")
         return
     id_match = re.match(r'id:(\d+)', query, re.IGNORECASE)
     if id_match:
         target_id = int(id_match.group(1))
-        db["schedules"] = [s for s in db["schedules"] if s.get("id") != target_id]
-        deleted = original_count - len(db["schedules"])
+        before = len(db["schedules"])
+        db["schedules"] = [s for s in db["schedules"] if not (s.get("id") == target_id and s.get("chat_id") == chat_id)]
+        deleted = before - len(db["schedules"])
         save_db(db)
         if deleted:
             bot.reply_to(message, f"🗑️ Deleted task with ID {target_id}.")
         else:
-            bot.reply_to(message, f"🚫 No task found with ID {target_id}. Check /active.")
+            bot.reply_to(message, f"🚫 No task found with ID {target_id} in this chat. Check /active.")
         return
-    db["schedules"] = [s for s in db.get("schedules", []) if query.lower() not in s["task"].lower()]
-    deleted = original_count - len(db["schedules"])
+    before = len(db.get("schedules", []))
+    db["schedules"] = [s for s in db.get("schedules", []) if not (s.get("chat_id") == chat_id and query.lower() in s["task"].lower())]
+    deleted = before - len(db["schedules"])
     if deleted:
         save_db(db)
         bot.reply_to(message, f"🗑️ Deleted {deleted} task(s) matching '{query}'.")
@@ -1063,24 +1189,203 @@ def delete_task(message):
         bot.reply_to(message, f"🚫 No tasks found matching '{query}'. Check /active.")
 
 # ==========================================
-# 27. /upload
+# 26B. /edit  — edit by task keyword, with disambiguation when ambiguous
 # ==========================================
-@bot.message_handler(commands=['upload'], content_types=['text', 'document'])
+def apply_schedule_edit(item: dict, new_date: str, new_time: str):
+    if new_date:
+        item["date"] = new_date
+    if new_time:
+        item["time"] = new_time
+
+def format_edit_confirmation(item: dict) -> str:
+    return (
+        f"✏️ Schedule Updated!\n"
+        f"• Task: {item['task']}\n"
+        f"• Date: {item['date']}\n"
+        f"• Time: {item.get('time','08:00 AM')}"
+    )
+
+@bot.message_handler(commands=['edit'])
+def edit_by_task(message):
+    query = message.text.replace("/edit", "", 1).strip()
+    if not query:
+        bot.reply_to(
+            message,
+            "⚠️ Usage: /edit [task keyword] [new date/time]\n"
+            "Examples:\n"
+            "/edit run tom 9am\n"
+            "/edit enrollment 06-30-2026 10am"
+        )
+        return
+    db = load_db()
+    chat_id = message.chat.id
+    chat_schedules = get_chat_schedules(db, chat_id)
+    if not chat_schedules:
+        bot.reply_to(message, "🚫 No schedules found for this chat. Use /active to check.")
+        return
+    now_ph = datetime.now(PH_TZ)
+    new_date = parse_date_only(query, now_ph)
+    new_time = parse_time_only(query)
+    keywords = extract_task_keywords(query)
+    candidates = find_matching_tasks(chat_schedules, keywords)
+    if not candidates:
+        bot.reply_to(message, f"🚫 No tasks matching '{query}'. Use /active to see task names.")
+        return
+    if not new_date and not new_time:
+        bot.reply_to(message, "⚠️ I couldn't detect a new date or time in your request. Include one, e.g. '/edit run tom 9am'.")
+        return
+    if len(candidates) == 1:
+        apply_schedule_edit(candidates[0], new_date, new_time)
+        save_db(db)
+        bot.reply_to(message, format_edit_confirmation(candidates[0]))
+        return
+    # Multiple matches -> ask the user to pick by number
+    lines = [f"{i+1}. {c['task']} {c.get('time','')}".strip() for i, c in enumerate(candidates)]
+    PENDING_EDITS[chat_id] = {
+        "candidates": [c["id"] for c in candidates],
+        "new_date": new_date,
+        "new_time": new_time,
+    }
+    bot.reply_to(message, "⚠️ Multiple matches found. Reply with the number:\n\n" + "\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text and m.text.strip().isdigit() and m.chat.id in PENDING_EDITS)
+def handle_edit_selection(message):
+    chat_id = message.chat.id
+    pending = PENDING_EDITS.pop(chat_id, None)
+    if not pending:
+        return
+    choice = int(message.text.strip()) - 1
+    if choice < 0 or choice >= len(pending["candidates"]):
+        bot.reply_to(message, "🚫 Invalid selection.")
+        return
+    target_id = pending["candidates"][choice]
+    db = load_db()
+    target = next((s for s in db["schedules"] if s.get("id") == target_id and s.get("chat_id") == chat_id), None)
+    if not target:
+        bot.reply_to(message, "🚫 That task no longer exists.")
+        return
+    apply_schedule_edit(target, pending["new_date"], pending["new_time"])
+    save_db(db)
+    bot.reply_to(message, format_edit_confirmation(target))
+
+# ==========================================
+# 26C. /parse — testing helper for date/time/task extraction
+# ==========================================
+@bot.message_handler(commands=['parse'])
+def parse_test(message):
+    raw_text = message.text.replace("/parse", "", 1).strip()
+    if not raw_text:
+        bot.reply_to(message, "⚠️ Usage: /parse [text]\nExample: /parse enrollment 06-30-2026 8am")
+        return
+    now_ph = datetime.now(PH_TZ)
+    parsed_dt, matched_str = parse_schedule_time(raw_text, now_ph)
+    if not parsed_dt:
+        bot.reply_to(message, "🔍 No date/time detected.")
+        return
+    task = clean_task_text(raw_text, matched_str)
+    bot.reply_to(
+        message,
+        f"Date: {parsed_dt.strftime('%Y-%m-%d')}\n"
+        f"Time: {parsed_dt.strftime('%I:%M %p')}\n"
+        f"Task: {task}"
+    )
+
+# ==========================================
+# 27. /upload  (supports photos, documents, and plain text notes)
+# ==========================================
+@bot.message_handler(commands=['upload'], content_types=['text', 'document', 'photo'])
 def handle_upload(message):
-    args = message.text.split(maxsplit=1) if message.text else []
-    if message.content_type == 'document' and message.caption:
+    # The title comes from whatever follows "/upload " — in the caption when
+    # uploading a photo/document, or in the message text for a plain note.
+    if message.content_type in ('document', 'photo') and message.caption:
         args = message.caption.split(maxsplit=1)
+    else:
+        args = message.text.split(maxsplit=1) if message.text else []
     if len(args) < 2:
-        bot.reply_to(message, "⚠️ Use: /upload [title] with a file or text.")
+        bot.reply_to(message, "⚠️ Use: /upload [title] together with a photo, file, or text.\nExample: caption a photo with '/upload math'")
         return
     title = args[1].lower().strip()
     db = load_db()
-    if message.content_type == 'document':
-        db["notes"][title] = {"type": "file", "file_id": message.document.file_id}
+    chat_id = message.chat.id
+    record = {
+        "id": int(time.time() * 1000),
+        "title": title,
+        "chat_id": chat_id,
+    }
+    if message.content_type == 'photo':
+        # Telegram sends multiple resolutions; the last one is the largest.
+        record["type"] = "photo"
+        record["file_id"] = message.photo[-1].file_id
+    elif message.content_type == 'document':
+        record["type"] = "file"
+        record["file_id"] = message.document.file_id
+        record["file_name"] = message.document.file_name
     else:
-        db["notes"][title] = {"type": "text", "content": f"Notes for {title}."}
+        record["type"] = "text"
+        record["content"] = args[1].strip()
+    db["notes"].append(record)
     save_db(db)
-    bot.reply_to(message, f"✅ Saved '{title}' notes.")
+    kind_label = {"photo": "photo", "file": "file", "text": "note"}[record["type"]]
+    bot.reply_to(message, f"✅ Saved {kind_label} under '{title}'.\nID: {record['id']}\nUse /deleteupload id:{record['id']} to remove it.")
+
+# ==========================================
+# 27B. /deleteupload (scoped to this chat)
+# ==========================================
+@bot.message_handler(commands=['deleteupload'])
+def delete_upload(message):
+    query = message.text.replace("/deleteupload", "", 1).strip()
+    if not query:
+        bot.reply_to(
+            message,
+            "⚠️ Provide a keyword or ID.\n"
+            "Examples:\n"
+            "• /deleteupload math — by title keyword\n"
+            "• /deleteupload id:1234567890 — by ID\n"
+            "• /deleteupload all — wipe all uploads in this chat"
+        )
+        return
+    db = load_db()
+    chat_id = message.chat.id
+    original_count = len(get_chat_notes(db, chat_id))
+    if query.lower() == "all":
+        db["notes"] = [n for n in db.get("notes", []) if n.get("chat_id") != chat_id]
+        save_db(db)
+        bot.reply_to(message, f"🗑️ Cleared all {original_count} upload(s) for this chat.")
+        return
+    id_match = re.match(r'id:(\d+)', query, re.IGNORECASE)
+    if id_match:
+        target_id = int(id_match.group(1))
+        before = len(db["notes"])
+        db["notes"] = [n for n in db["notes"] if not (n.get("id") == target_id and n.get("chat_id") == chat_id)]
+        deleted = before - len(db["notes"])
+        save_db(db)
+        if deleted:
+            bot.reply_to(message, f"🗑️ Deleted upload with ID {target_id}.")
+        else:
+            bot.reply_to(message, f"🚫 No upload found with ID {target_id} in this chat.")
+        return
+    before = len(db.get("notes", []))
+    db["notes"] = [n for n in db.get("notes", []) if not (n.get("chat_id") == chat_id and query.lower() in n.get("title", "").lower())]
+    deleted = before - len(db["notes"])
+    if deleted:
+        save_db(db)
+        bot.reply_to(message, f"🗑️ Deleted {deleted} upload(s) matching '{query}'.")
+    else:
+        bot.reply_to(message, f"🚫 No uploads found matching '{query}'.")
+
+# ==========================================
+# 27C. /uploads — list uploads saved in this chat
+# ==========================================
+@bot.message_handler(commands=['uploads'])
+def list_uploads(message):
+    db = load_db()
+    items = get_chat_notes(db, message.chat.id)
+    if not items:
+        bot.reply_to(message, "📎 No uploads saved in this chat yet.\nTry: caption a photo with '/upload math'")
+        return
+    type_emoji = {"photo": "🖼️", "file": "📄", "text": "📝"}
+    lines = [f"{type_emoji.get(n['type'],'📎')} [ID:{n['id']}] {n['title']}" for n in items]
+    bot.reply_to(message, "📎 Uploads in this chat\n\n" + "\n".join(lines))
 
 # ==========================================
 # 28. /help
@@ -1091,34 +1396,68 @@ def show_help(message):
         "📖 COMMAND REFERENCE\n\n"
         "ONE-TIME SCHEDULES\n"
         "• -sched [task] [date] [time]\n"
+        "• Multiple lines in one message are all saved (bulk paste)\n"
         "• -update \"task\" -> date: 2026-06-26\n"
         "• -update \"task\" -> time: 7:00 PM\n"
-        "• /active — view upcoming\n"
-        "• /delete [keyword or id:xxx or all]\n\n"
+        "• /active — view upcoming (this chat only)\n"
+        "• /delete [keyword or id:xxx or all]\n"
+        "• /edit [task keyword] [new date/time] — e.g. /edit run tom 9am\n"
+        "• /parse [text] — test how a date/time/task would be parsed\n\n"
+        "DATE WORDS SUPPORTED: today, tomorrow/tom, weekday names & abbreviations\n"
+        "(mon, tue, wed, thu, fri, sat, sun), YYYY-MM-DD, MM-DD-YYYY, MM/DD/YYYY,\n"
+        "Month Day [Year] (e.g. June 30 2026, Jun 30)\n\n"
         "RECURRING TASKS\n"
         "• -remind me to [task] [time] everyday\n"
         "• -[task] [time] every monday\n"
         "• -[task] [time] every month\n"
-        "• /recurring — view all\n"
+        "• /recurring — view all (this chat only)\n"
         "• /editrecurring id:xxx time: 9pm\n"
         "• /delrecurring [id:xxx or keyword or all]\n\n"
         "SPECIAL EVENTS\n"
         "• -birthday [name] [month day]\n"
         "• -anniversary [name] [month day]\n"
         "• -monthsary [name] [day]\n"
-        "• /specials — view all\n"
+        "• /specials — view all (this chat only)\n"
         "• /editspecial id:xxx time: 8am\n"
         "• /delspecial [id:xxx or keyword or all]\n\n"
         "AI CHAT\n"
         "• Ask any question ending with ?\n"
         "• Uses Gemini -> OpenRouter -> NVIDIA fallback\n\n"
-        "NOTES\n"
-        "• /upload [title] — save a note or file"
+        "UPLOADS (photos, files, notes)\n"
+        "• Caption a photo or file with /upload [title] (e.g. '/upload math')\n"
+        "• /upload [title] [text] — save a plain text note\n"
+        "• /uploads — list everything uploaded in this chat\n"
+        "• /deleteupload [keyword or id:xxx or all]\n"
+        "• Ask 'do I have math pics?' or 'anything about math?' and matching\n"
+        "  schedules, recurring tasks, and uploads tagged 'math' come back —\n"
+        "  photos/files are sent directly.\n\n"
+        "🔒 All schedules, recurring tasks, special events, and uploads are\n"
+        "private to the group/chat they were created in — no other chat can\n"
+        "see or delete another chat's data."
     )
 
 # ==========================================
-# 29. QUESTION FALLBACK
+# 29. QUESTION FALLBACK (scoped) — now also searches uploaded notes/photos
 # ==========================================
+TOPIC_QUESTION_SIGNALS = [
+    "sched", "event", "task", "remind", "cath", "mico", "tomorrow", "today", "tmr",
+    "pic", "pics", "picture", "pictures", "photo", "photos", "image", "images",
+    "note", "notes", "anything about", "have anything", "do i have",
+]
+
+def search_chat_topic(db: dict, chat_id, keywords: list) -> dict:
+    """Find everything in this chat (schedules, recurring, specials, notes)
+    whose text matches any of the given keywords. If keywords is empty,
+    returns everything for the chat."""
+    def matches(text):
+        return (not keywords) or any(w in text.lower() for w in keywords)
+    return {
+        "schedules": [s for s in get_chat_schedules(db, chat_id) if matches(s["task"])],
+        "recurring": [r for r in get_chat_recurring(db, chat_id) if matches(r["task"])],
+        "specials": [s for s in get_chat_specials(db, chat_id) if matches(s["label"])],
+        "notes": [n for n in get_chat_notes(db, chat_id) if matches(n.get("title", ""))],
+    }
+
 @bot.message_handler(func=lambda m: m.text is not None)
 def smart_question_fallback(message):
     text = message.text.strip()
@@ -1126,25 +1465,47 @@ def smart_question_fallback(message):
         return
     text_lower = text.lower()
     db = load_db()
-    if any(k in text_lower for k in ["sched","event","task","remind","cath","mico","tomorrow","today","tmr"]):
-        matches = []
+    chat_id = message.chat.id
+    if any(k in text_lower for k in TOPIC_QUESTION_SIGNALS):
         now_ph = datetime.now(PH_TZ)
         date_filters = []
-        if re.search(r'\btomorrow\b|\btmr\b|\btmrw\b', text_lower):
+        if re.search(r'\btomorrow\b|\btmr\b|\btmrw\b|\btom\b', text_lower):
             date_filters.append((now_ph + timedelta(days=1)).strftime("%Y-%m-%d"))
         if re.search(r'\btoday\b', text_lower):
             date_filters.append(now_ph.strftime("%Y-%m-%d"))
-        keywords = re.sub(r'\b(tomorrow|today|tmr|tmrw|sched|task|event|any|tasks|for|are|there|is|do|i|have|a|an|the)\b', '', text_lower)
+        keywords = re.sub(
+            r'\b(tomorrow|today|tmr|tmrw|tom|sched|task|event|any|tasks|for|are|there|'
+            r'is|do|i|have|a|an|the|anything|about|pic|pics|picture|pictures|photo|photos|'
+            r'image|images|note|notes|my)\b',
+            '', text_lower
+        )
         keywords = [w for w in keywords.replace("?", "").split() if len(w) > 2]
-        for item in db.get("schedules", []):
-            date_match = item["date"] in date_filters if date_filters else True
-            keyword_match = any(word in item["task"].lower() for word in keywords) if keywords else True
-            if date_match and keyword_match:
-                matches.append(f"• [{item['date']} at {item.get('time','Anytime')}] {item['task']}")
-        if matches:
-            bot.reply_to(message, "📅 Found in your schedule:\n" + "\n".join(matches))
-        else:
-            bot.reply_to(message, "🔍 No matching schedules found. Try /active to see everything.")
+        results = search_chat_topic(db, chat_id, keywords)
+        if date_filters:
+            results["schedules"] = [s for s in results["schedules"] if s["date"] in date_filters]
+        reply_lines = []
+        for item in results["schedules"]:
+            reply_lines.append(f"📅 [{item['date']} at {item.get('time','Anytime')}] {item['task']}")
+        for item in results["recurring"]:
+            reply_lines.append(f"🔁 {item['task']} (every {item['recur_type']} at {item.get('time','08:00 AM')})")
+        for item in results["specials"]:
+            reply_lines.append(f"🎉 {item['label']} ({item['special_type']})")
+        if reply_lines:
+            bot.reply_to(message, "Found in your schedule:\n" + "\n".join(reply_lines))
+        elif not results["notes"]:
+            bot.reply_to(message, "🔍 No matching schedules, tasks, or uploads found. Try /active to see everything.")
+        # Send back any matching uploads (photos/files/notes) as their own messages.
+        for note in results["notes"]:
+            caption = f"📎 {note.get('title','').capitalize()}"
+            try:
+                if note["type"] == "photo":
+                    bot.send_photo(chat_id, note["file_id"], caption=caption)
+                elif note["type"] == "file":
+                    bot.send_document(chat_id, note["file_id"], caption=caption)
+                else:
+                    bot.send_message(chat_id, f"{caption}\n{note.get('content','')}")
+            except Exception as e:
+                print(f"[upload-send] failed for note {note.get('id')}: {e}")
         return
     reply = ask_ai(text)
     bot.reply_to(message, reply)
@@ -1259,19 +1620,20 @@ def reminder_loop():
                     item["last_notified"] = now_ph.strftime("%Y-%m-%d %H:%M")
                     changed = True
 
+            # Saturday weekly audit — sent per chat, scoped to that chat's own schedules only
             if now_ph.weekday() == 5 and now_ph.hour == 9 and now_ph.minute == 0:
                 chat_ids_seen = set()
-                audit_items = []
                 for item in db.get("schedules", []):
                     cid = item.get("chat_id")
-                    if cid and cid not in chat_ids_seen:
+                    if cid:
                         chat_ids_seen.add(cid)
-                    audit_items.append(
-                        f"• [{item['date']} at {item.get('time','Anytime')}] {item['task']}"
-                    )
                 for cid in chat_ids_seen:
+                    chat_items = [s for s in db.get("schedules", []) if s.get("chat_id") == cid]
+                    audit_lines = [
+                        f"• [{s['date']} at {s.get('time','Anytime')}] {s['task']}" for s in chat_items
+                    ]
                     audit_msg = "📋 SATURDAY WEEKLY AUDIT\n\n"
-                    audit_msg += "\n".join(audit_items) if audit_items else "No events logged."
+                    audit_msg += "\n".join(audit_lines) if audit_lines else "No events logged."
                     bot.send_message(cid, audit_msg)
                 time.sleep(70)
 
