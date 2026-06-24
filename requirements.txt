@@ -3,3 +3,5 @@ google-genai
 dateparser
 pytz
 python-dotenv
+requests[socks]
+PySocks
