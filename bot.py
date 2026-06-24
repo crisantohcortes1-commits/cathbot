@@ -39,20 +39,17 @@ PENDING_EDITS = {}
 # ==========================================
 # 2. DATABASE HELPERS
 # ==========================================
-def load_db():
+def load_db() -> dict:
     if not os.path.exists(DATA_FILE):
-        return {"notes": {}, "schedules": [], "classes": {}, "recurring": [], "specials": []}
+        return {"notes": [], "schedules": [], "classes": {}, "recurring": [], "specials": []}
     with open(DATA_FILE, "r") as f:
         try:
             data = json.load(f)
         except json.JSONDecodeError:
-            return {"notes": {}, "schedules": [], "classes": {}, "recurring": [], "specials": []}
-    # "notes" is a per-chat-scoped LIST of upload records (not a dict keyed
-    # by title) so that the same title (e.g. "math") can exist independently
-    # in different groups, and so every record can carry its own chat_id.
+            return {"notes": [], "schedules": [], "classes": {}, "recurring": [], "specials": []}
     notes = data.get("notes")
     if not isinstance(notes, list):
-        notes = []  # migrate away from the old unscoped dict format
+        notes = []
     data["notes"] = notes
     data.setdefault("schedules", [])
     data.setdefault("classes", {})
@@ -60,17 +57,13 @@ def load_db():
     data.setdefault("specials", [])
     return data
 
-def save_db(data):
+def save_db(data: dict) -> None:
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
 # ------------------------------------------
 # 2A. PER-CHAT SECURITY / SCOPING HELPERS
 # ------------------------------------------
-# Every schedule / recurring task / special event is tagged with the chat_id
-# it was created in (group or private chat). All read & write commands below
-# MUST filter through these helpers so that data never leaks between chats.
-
 def get_chat_schedules(db: dict, chat_id) -> list:
     return [s for s in db.get("schedules", []) if s.get("chat_id") == chat_id]
 
@@ -95,10 +88,11 @@ def ask_ai(prompt: str) -> str:
                     model="gemini-2.5-flash",
                     contents=f"Answer this shortly and concisely: {prompt}"
                 )
-                return resp.text
+                return resp.text or "🤖 No response from Gemini."
 
             elif provider == "openrouter":
-                import urllib.request, json as _json
+                import urllib.request
+                import json as _json
                 payload = _json.dumps({
                     "model": "mistralai/mistral-7b-instruct:free",
                     "messages": [{"role": "user", "content": f"Answer this shortly and concisely: {prompt}"}],
@@ -119,7 +113,8 @@ def ask_ai(prompt: str) -> str:
                 return data["choices"][0]["message"]["content"]
 
             elif provider == "nvidia":
-                import urllib.request, json as _json
+                import urllib.request
+                import json as _json
                 payload = _json.dumps({
                     "model": "meta/llama-3.1-8b-instruct",
                     "messages": [{"role": "user", "content": f"Answer this shortly and concisely: {prompt}"}],
@@ -353,7 +348,7 @@ MONTH_NAME_MAP = {
     'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12,
 }
 
-def parse_date_only(raw_text: str, now_ph: datetime) -> str:
+def parse_date_only(raw_text: str, now_ph: datetime) -> str | None:
     text = fuzzy_correct(raw_text)
     now_naive = now_ph.replace(tzinfo=None)
 
@@ -394,7 +389,7 @@ def parse_date_only(raw_text: str, now_ph: datetime) -> str:
         if re.search(pat, stripped, re.IGNORECASE):
             return (now_naive + timedelta(days=offset)).strftime("%Y-%m-%d")
 
-    # 5. Weekday names — full and abbreviated (mon, tue, wed, thu, fri, sat, sun)
+    # 5. Weekday names — full and abbreviated
     weekday_map = {
         'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
         'friday': 4, 'saturday': 5, 'sunday': 6
@@ -409,7 +404,7 @@ def parse_date_only(raw_text: str, now_ph: datetime) -> str:
                 days_ahead = 7
             return (now_naive + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
-    # 6. Month name + day, with optional year (e.g. "June 30 2026", "Jun 30", "30 June 2026")
+    # 6. Month name + day, with optional year
     month_alt = '|'.join(MONTH_NAME_MAP.keys())
     month_day = re.search(
         r'\b(' + month_alt + r')\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\b'
@@ -436,7 +431,7 @@ def parse_date_only(raw_text: str, now_ph: datetime) -> str:
 # ==========================================
 # 11. ISOLATED TIME PARSER
 # ==========================================
-def parse_time_only(raw_text: str) -> str:
+def parse_time_only(raw_text: str) -> str | None:
     text = raw_text.strip()
     m = re.search(r'\b(\d{1,2}):(\d{2})\s*(am|pm)\b', text, re.IGNORECASE)
     if m:
@@ -492,13 +487,6 @@ def parse_schedule_time(raw_text: str, now_ph: datetime) -> tuple:
     corrected = fuzzy_correct(raw_text)
     now_naive = now_ph.replace(tzinfo=None)
 
-    # ------------------------------------------------------------------
-    # PRIORITY PASS: explicit date formats (ISO, dash MM-DD-YYYY, slash,
-    # month-name [+year], weekday, today/tomorrow) always win over the
-    # fuzzy dateparser fallback below. This fixes cases where a clearly
-    # specified date (e.g. "06-30-2026") was getting ignored in favor of
-    # "today" because the free-text parser got confused by other words.
-    # ------------------------------------------------------------------
     explicit_date_str = parse_date_only(raw_text, now_ph)
     explicit_time_str = parse_time_only(corrected)
     if explicit_date_str:
@@ -512,9 +500,6 @@ def parse_schedule_time(raw_text: str, now_ph: datetime) -> tuple:
                 final_dt = datetime(base_date.year, base_date.month, base_date.day, t_obj.hour, t_obj.minute)
             else:
                 final_dt = datetime(base_date.year, base_date.month, base_date.day, 8, 0)
-            # matched_str is only used as a best-effort hint for clean_task_text;
-            # clean_task_text itself strips date/time tokens with its own
-            # comprehensive patterns, so an empty/loose hint here is safe.
             return final_dt, ""
 
     time_re = re.compile(
@@ -610,28 +595,20 @@ def clean_task_text(raw_text: str, matched_date_str: str) -> str:
     for pattern in noise_patterns:
         task = re.sub(pattern, "", task, flags=re.IGNORECASE)
     task = re.sub(r'\s+', ' ', task).strip(" .,")
-    return task.capitalize() if task else raw_text.capitalize()
+    return (task.capitalize() if task else raw_text.capitalize()) or ""
 
 # ==========================================
 # 14. RECURRING TASK HELPERS
 # ==========================================
 RECUR_TYPES = {
-    # NOTE: ordered dict-wise — daily is checked first. "each" is treated as a
-    # daily signal (e.g. "...every 3:30pm each timestamp" -> daily).
     'daily':   r'\beveryday\b|\bdaily\b|\bevery\s+day\b|\beach\b',
     'weekly':  r'\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b|\bweekly\b',
-    # Monthly day-of-month reference now REQUIRES an ordinal suffix
-    # (1st/2nd/3rd/4th...) so that a bare "every 3:30" (a TIME, not a day
-    # number) never gets misread as "every 3rd of the month".
     'monthly': r'\bevery\s+month\b|\bmonthly\b|\bevery\s+\d{1,2}(?:st|nd|rd|th)\b',
     'yearly':  r'\bevery\s+year\b|\bannually\b|\byearly\b',
 }
 
-def detect_recur_type(text: str) -> str:
+def detect_recur_type(text: str) -> str | None:
     t = text.lower()
-    # Strip out time-of-day tokens BEFORE testing the recurrence patterns.
-    # This is what prevents "every 3:30 pm" from being parsed as "every 3"
-    # (a monthly day-of-month reference) by the monthly regex.
     t = re.sub(r'\b\d{1,2}:\d{2}\s*(?:am|pm)?\b', '', t, flags=re.IGNORECASE)
     t = re.sub(r'\b\d{1,2}\s*(?:am|pm)\b', '', t, flags=re.IGNORECASE)
     for rtype, pat in RECUR_TYPES.items():
@@ -639,7 +616,7 @@ def detect_recur_type(text: str) -> str:
             return rtype
     return None
 
-def detect_recur_weekday(text: str) -> str:
+def detect_recur_weekday(text: str) -> str | None:
     days = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']
     t = text.lower()
     for d in days:
@@ -650,7 +627,7 @@ def detect_recur_weekday(text: str) -> str:
             return full.capitalize()
     return None
 
-def detect_recur_monthday(text: str) -> int:
+def detect_recur_monthday(text: str) -> int | None:
     m = re.search(r'\bevery\s+(\d{1,2})(?:st|nd|rd|th)?\b', text.lower())
     if m:
         return int(m.group(1))
@@ -712,7 +689,7 @@ SPECIAL_TYPES = {
     'monthsary':   r'\bmonthsary\b|\bmonthiversary\b',
 }
 
-def detect_special_type(text: str) -> str:
+def detect_special_type(text: str) -> str | None:
     t = text.lower()
     for stype, pat in SPECIAL_TYPES.items():
         if re.search(pat, t):
@@ -847,7 +824,7 @@ def handle_recurring_create(message, raw_text: str, recur_type: str):
     task_text = re.sub(r'\b\d{1,2}\s*(?:am|pm)\b', '', task_text, flags=re.IGNORECASE)
     task_text = re.sub(r'\s+', ' ', task_text).strip(" .,")
     task_label = task_text.capitalize() or "Recurring Task"
-    item = {
+    item: dict = {
         "id": int(time.time() * 1000),
         "task": task_label,
         "time": t_str,
@@ -860,7 +837,7 @@ def handle_recurring_create(message, raw_text: str, recur_type: str):
         item["recur_day"] = day or "Monday"
     if recur_type == "monthly":
         md = detect_recur_monthday(raw_text)
-        item["recur_monthday"] = md or now_ph.day
+        item["recur_monthday"] = md if md is not None else now_ph.day
     if recur_type == "yearly":
         item["recur_month"] = now_ph.month
         item["recur_day_num"] = now_ph.day
@@ -904,7 +881,7 @@ def handle_special_create(message, raw_text: str, special_type: str):
     label_text = re.sub(r'\b\d{1,2}\b', '', label_text)
     label_text = re.sub(r'\s+', ' ', label_text).strip(" .,")
     label = label_text.capitalize() or special_type.capitalize()
-    item = {
+    item: dict = {
         "id": int(time.time() * 1000),
         "label": label,
         "special_type": special_type,
@@ -1189,9 +1166,9 @@ def delete_task(message):
         bot.reply_to(message, f"🚫 No tasks found matching '{query}'. Check /active.")
 
 # ==========================================
-# 26B. /edit  — edit by task keyword, with disambiguation when ambiguous
+# 26B. /edit — edit by task keyword, with disambiguation when ambiguous
 # ==========================================
-def apply_schedule_edit(item: dict, new_date: str, new_time: str):
+def apply_schedule_edit(item: dict, new_date: str | None, new_time: str | None) -> None:
     if new_date:
         item["date"] = new_date
     if new_time:
@@ -1291,12 +1268,10 @@ def parse_test(message):
     )
 
 # ==========================================
-# 27. /upload  (supports photos, documents, and plain text notes)
+# 27. /upload (supports photos, documents, and plain text notes)
 # ==========================================
 @bot.message_handler(commands=['upload'], content_types=['text', 'document', 'photo'])
 def handle_upload(message):
-    # The title comes from whatever follows "/upload " — in the caption when
-    # uploading a photo/document, or in the message text for a plain note.
     if message.content_type in ('document', 'photo') and message.caption:
         args = message.caption.split(maxsplit=1)
     else:
@@ -1307,13 +1282,12 @@ def handle_upload(message):
     title = args[1].lower().strip()
     db = load_db()
     chat_id = message.chat.id
-    record = {
+    record: dict = {
         "id": int(time.time() * 1000),
         "title": title,
         "chat_id": chat_id,
     }
     if message.content_type == 'photo':
-        # Telegram sends multiple resolutions; the last one is the largest.
         record["type"] = "photo"
         record["file_id"] = message.photo[-1].file_id
     elif message.content_type == 'document':
@@ -1437,7 +1411,7 @@ def show_help(message):
     )
 
 # ==========================================
-# 29. QUESTION FALLBACK (scoped) — now also searches uploaded notes/photos
+# 29. QUESTION FALLBACK (scoped) — also searches uploaded notes/photos
 # ==========================================
 TOPIC_QUESTION_SIGNALS = [
     "sched", "event", "task", "remind", "cath", "mico", "tomorrow", "today", "tmr",
@@ -1446,9 +1420,6 @@ TOPIC_QUESTION_SIGNALS = [
 ]
 
 def search_chat_topic(db: dict, chat_id, keywords: list) -> dict:
-    """Find everything in this chat (schedules, recurring, specials, notes)
-    whose text matches any of the given keywords. If keywords is empty,
-    returns everything for the chat."""
     def matches(text):
         return (not keywords) or any(w in text.lower() for w in keywords)
     return {
@@ -1473,13 +1444,13 @@ def smart_question_fallback(message):
             date_filters.append((now_ph + timedelta(days=1)).strftime("%Y-%m-%d"))
         if re.search(r'\btoday\b', text_lower):
             date_filters.append(now_ph.strftime("%Y-%m-%d"))
-        keywords = re.sub(
+        keywords_str = re.sub(
             r'\b(tomorrow|today|tmr|tmrw|tom|sched|task|event|any|tasks|for|are|there|'
             r'is|do|i|have|a|an|the|anything|about|pic|pics|picture|pictures|photo|photos|'
             r'image|images|note|notes|my)\b',
             '', text_lower
         )
-        keywords = [w for w in keywords.replace("?", "").split() if len(w) > 2]
+        keywords = [w for w in keywords_str.replace("?", "").split() if len(w) > 2]
         results = search_chat_topic(db, chat_id, keywords)
         if date_filters:
             results["schedules"] = [s for s in results["schedules"] if s["date"] in date_filters]
@@ -1494,7 +1465,6 @@ def smart_question_fallback(message):
             bot.reply_to(message, "Found in your schedule:\n" + "\n".join(reply_lines))
         elif not results["notes"]:
             bot.reply_to(message, "🔍 No matching schedules, tasks, or uploads found. Try /active to see everything.")
-        # Send back any matching uploads (photos/files/notes) as their own messages.
         for note in results["notes"]:
             caption = f"📎 {note.get('title','').capitalize()}"
             try:
@@ -1599,7 +1569,7 @@ def reminder_loop():
                             already_fired = True
                     except ValueError:
                         pass
-                type_emoji = {'birthday': '🎂', 'anniversary': '💍', 'monthsary': '💕'}
+                type_emoji = {"birthday": "🎂", "anniversary": "💍", "monthsary": "💕"}
                 emoji = type_emoji.get(item["special_type"], "🎉")
                 if 23 * 3600 + 55 * 60 <= diff <= 24 * 3600 + 5 * 60:
                     last_warn = item.get("last_warned_24h")
@@ -1620,9 +1590,9 @@ def reminder_loop():
                     item["last_notified"] = now_ph.strftime("%Y-%m-%d %H:%M")
                     changed = True
 
-            # Saturday weekly audit — sent per chat, scoped to that chat's own schedules only
+            # Saturday weekly audit
             if now_ph.weekday() == 5 and now_ph.hour == 9 and now_ph.minute == 0:
-                chat_ids_seen = set()
+                chat_ids_seen: set = set()
                 for item in db.get("schedules", []):
                     cid = item.get("chat_id")
                     if cid:
@@ -1635,7 +1605,8 @@ def reminder_loop():
                     audit_msg = "📋 SATURDAY WEEKLY AUDIT\n\n"
                     audit_msg += "\n".join(audit_lines) if audit_lines else "No events logged."
                     bot.send_message(cid, audit_msg)
-                time.sleep(70)
+                import time as _time
+                _time.sleep(70)
 
             if changed:
                 save_db(db)
