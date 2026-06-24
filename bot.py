@@ -18,6 +18,11 @@ GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 NVIDIA_API_KEY     = os.environ.get("NVIDIA_API_KEY", "")
 
+# --- TELEGRAM REGIONAL PROXY FIX ---
+from telebot import apihelper
+apihelper.proxy = {'https': 'http://98.83.211.100:3128'}
+# -----------------------------------
+
 bot       = telebot.TeleBot(BOT_TOKEN)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
