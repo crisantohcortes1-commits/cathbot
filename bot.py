@@ -3,6 +3,7 @@ import json
 import time
 import re
 import telebot
+from telebot import apihelper  # Imported for proxy handling
 import threading
 from datetime import datetime, timedelta
 import dateparser
@@ -18,10 +19,11 @@ GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 NVIDIA_API_KEY     = os.environ.get("NVIDIA_API_KEY", "")
 
-# --- TELEGRAM REGIONAL PROXY FIX ---
-from telebot import apihelper
-apihelper.proxy = {'https': 'http://98.83.211.100:3128'}
-# -----------------------------------
+# Configure SOCKS5 proxy before initializing the bot
+apihelper.proxy = {
+    'http': 'socks5h://47.253.211.16:1080',
+    'https': 'socks5h://47.253.211.16:1080'
+}
 
 bot       = telebot.TeleBot(BOT_TOKEN)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -1631,6 +1633,7 @@ print(f"🤖 AI providers: {active_providers}")
 
 while True:
     try:
+        # Increased timeouts give the proxy breathing room
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
     except Exception as e:
         print(f"❌ Polling error. Retrying in 10s... ({e})")
